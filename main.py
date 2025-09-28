@@ -403,19 +403,31 @@ class SweepGraph(ttk.Frame):
         self.margin = 50
         self.axis_choices = list(self.AXIS_FIELDS.keys())
         self._x_axis_label = "电压 (V)"; self._y_axis_label = "电流 (A)"
+        self._base_x_label = self._x_axis_label; self._base_y_label = self._y_axis_label
         self._data: List[Tuple[float, float]] = []; self._raw: List[MeasurementPoint] = []
         self._x_range = (0.0, 1.0); self._y_range = (-1.0, 1.0)
         self._t0: Optional[_dt.datetime] = None
         self._log_x = False; self._log_y = False
         self._minor_div = 5
+        self._transform_mode = "none"
         self.canvas.bind("<Configure>", lambda e: self.redraw())
 
     def set_log(self, logx: bool, logy: bool) -> None:
         self._log_x = logx; self._log_y = logy; self.redraw()
 
+    def set_transform(self, mode: str) -> None:
+        if self._transform_mode == mode:
+            return
+        self._transform_mode = mode
+        self.set_data(self._raw, x_axis=self._base_x_label, y_axis=self._base_y_label)
+
     def set_data(self, points: Iterable[MeasurementPoint], *, x_axis: Optional[str] = None, y_axis: Optional[str] = None) -> None:
-        if x_axis is not None: self._x_axis_label = x_axis
-        if y_axis is not None: self._y_axis_label = y_axis
+        if x_axis is not None:
+            self._base_x_label = x_axis
+        if y_axis is not None:
+            self._base_y_label = y_axis
+        self._x_axis_label = self._base_x_label
+        self._y_axis_label = self._base_y_label
         self._raw = list(points); self._t0 = None; self._data = []
 
         xf = self.AXIS_FIELDS.get(self._x_axis_label, ("index", ""))[0]
@@ -433,12 +445,53 @@ class SweepGraph(ttk.Frame):
         def to_log(v: float) -> float:
             eps = 1e-12; return math.log10(abs(v) + eps)
 
-        for p in self._raw:
-            xv = v_from(p, xf); yv = v_from(p, yf)
-            if not (math.isfinite(xv) and math.isfinite(yv)): continue
-            if self._log_x: xv = to_log(xv)
-            if self._log_y: yv = to_log(yv)
-            self._data.append((xv, yv))
+        transform = self._transform_mode
+        if transform == "sclc":
+            self._x_axis_label = "log10(|V|)"; self._y_axis_label = "log10(|I|)"
+            for p in self._raw:
+                v = float(p.voltage); i = float(p.current)
+                if not (math.isfinite(v) and math.isfinite(i)): continue
+                xv = to_log(v); yv = to_log(i)
+                self._data.append((xv, yv))
+        elif transform == "pf":
+            self._x_axis_label = "sqrt(|V|)"; self._y_axis_label = "ln(|I/V|)"
+            for p in self._raw:
+                v = float(p.voltage); i = float(p.current)
+                if not (math.isfinite(v) and math.isfinite(i)): continue
+                if math.isclose(v, 0.0, abs_tol=1e-18): continue
+                xv = math.sqrt(abs(v))
+                ratio = abs(i / v)
+                if ratio <= 0.0: continue
+                yv = math.log(ratio)
+                self._data.append((xv, yv))
+        elif transform == "fn":
+            self._x_axis_label = "1/V"; self._y_axis_label = "ln(|I/V^2|)"
+            for p in self._raw:
+                v = float(p.voltage); i = float(p.current)
+                if not (math.isfinite(v) and math.isfinite(i)): continue
+                if math.isclose(v, 0.0, abs_tol=1e-18): continue
+                xv = 1.0 / v
+                denom = v * v
+                ratio = abs(i / denom)
+                if ratio <= 0.0 or not math.isfinite(xv): continue
+                yv = math.log(ratio)
+                self._data.append((xv, yv))
+        elif transform == "schottky":
+            self._x_axis_label = "sqrt(|V|)"; self._y_axis_label = "ln(|I|)"
+            for p in self._raw:
+                v = float(p.voltage); i = float(p.current)
+                if not (math.isfinite(v) and math.isfinite(i)): continue
+                if abs(i) <= 0.0: continue
+                xv = math.sqrt(abs(v))
+                yv = math.log(abs(i))
+                self._data.append((xv, yv))
+        else:
+            for p in self._raw:
+                xv = v_from(p, xf); yv = v_from(p, yf)
+                if not (math.isfinite(xv) and math.isfinite(yv)): continue
+                if self._log_x: xv = to_log(xv)
+                if self._log_y: yv = to_log(yv)
+                self._data.append((xv, yv))
 
         if self._data:
             xs, ys = zip(*self._data)
@@ -543,7 +596,11 @@ class MeasurementApp(tk.Tk):
         self.resource_var = tk.StringVar(value="内置模拟器")
         self.resource_info_var = tk.StringVar(value="使用内置模拟器")
         self.snapshots_var = tk.BooleanVar(value=False)
-        self.auto_points_var = tk.BooleanVar(value=True)
+        self.auto_points_mode_var = tk.StringVar(value="from_step")
+        self._auto_mode_display_var = tk.StringVar(value="按步长算点数")
+        self._auto_calc_label: Optional[ttk.Label] = None
+        self._step_entry: Optional[ttk.Entry] = None
+        self._points_entry: Optional[ttk.Entry] = None
         self.filter_enable_var = tk.BooleanVar(value=False)
         self.filter_window_var = tk.IntVar(value=5)
         self.cycle_count_var = tk.IntVar(value=1)
@@ -567,6 +624,13 @@ class MeasurementApp(tk.Tk):
         self.x_axis_var_iv = tk.StringVar(value="电压 (V)")
         self.y_axis_var_iv = tk.StringVar(value="电流 (A)")
         self.logx_var_iv = tk.BooleanVar(value=False); self.logy_var_iv = tk.BooleanVar(value=False)
+        self.transform_mode_var_iv = tk.StringVar(value="none")
+        self.transform_flags_iv = {
+            "sclc": tk.BooleanVar(value=False),
+            "pf": tk.BooleanVar(value=False),
+            "fn": tk.BooleanVar(value=False),
+            "schottky": tk.BooleanVar(value=False),
+        }
 
         self.x_axis_var_vt = tk.StringVar(value="时间 (s)")
         self.y_axis_var_vt = tk.StringVar(value="电压 (V)")
@@ -580,6 +644,7 @@ class MeasurementApp(tk.Tk):
         self.graph_active: Optional[SweepGraph] = None
         self.result_tree_iv = None; self.result_tree_vt = None; self.result_tree_it = None
         self.result_tree_active: Optional[ttk.Treeview] = None
+        self._iv_axis_controls: Dict[str, ttk.Widget] = {}
 
         self._configure_styles()
         self._build_layout()
@@ -705,14 +770,42 @@ class MeasurementApp(tk.Tk):
         ttk.Label(axis, text="纵轴").pack(side=tk.LEFT)
         y_combo = ttk.Combobox(axis, textvariable=self.y_axis_var_iv, state="readonly", width=14)
         y_combo.pack(side=tk.LEFT, padx=(6, 18))
-        ttk.Checkbutton(axis, text="X 取 log10", variable=self.logx_var_iv, command=self._refresh_graph).pack(side=tk.LEFT, padx=10)
-        ttk.Checkbutton(axis, text="Y 取 log10", variable=self.logy_var_iv, command=self._refresh_graph).pack(side=tk.LEFT)
+        logx_chk = ttk.Checkbutton(axis, text="X 取 log10", variable=self.logx_var_iv, command=self._refresh_graph)
+        logx_chk.pack(side=tk.LEFT, padx=10)
+        logy_chk = ttk.Checkbutton(axis, text="Y 取 log10", variable=self.logy_var_iv, command=self._refresh_graph)
+        logy_chk.pack(side=tk.LEFT)
+
+        transforms = ttk.Frame(axis, style="White.TFrame")
+        transforms.pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(transforms, text="自动换算").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        transform_defs = [
+            ("sclc", "SCLC"),
+            ("pf", "PF"),
+            ("fn", "FN"),
+            ("schottky", "肖特基"),
+        ]
+        for idx, (mode, text) in enumerate(transform_defs):
+            chk = ttk.Checkbutton(
+                transforms,
+                text=text,
+                variable=self.transform_flags_iv[mode],
+                command=lambda m=mode: self._toggle_transform_mode(m),
+            )
+            chk.grid(row=0, column=idx + 1, sticky="w", padx=(0, 6))
+            self._iv_axis_controls[f"transform_{mode}"] = chk
 
         self.graph_iv = SweepGraph(top); self.graph_iv.pack(fill=tk.BOTH, expand=True)
         x_combo.configure(values=self.graph_iv.axis_choices)
         y_combo.configure(values=self.graph_iv.axis_choices)
         x_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_graph())
         y_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_graph())
+        self._iv_axis_controls.update({
+            "x_combo": x_combo,
+            "y_combo": y_combo,
+            "logx": logx_chk,
+            "logy": logy_chk,
+        })
+        self._update_transform_controls()
 
         # Row 1: three compact columns
         src = ttk.Frame(parent, style="White.TFrame"); src.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=4)
@@ -725,6 +818,153 @@ class MeasurementApp(tk.Tk):
 
         # Row 2: Result table across all columns
         self.result_tree_iv = self._build_result_table(parent, row=2, col=0, colspan=3)
+
+    def _toggle_transform_mode(self, mode: str) -> None:
+        flag = self.transform_flags_iv.get(mode)
+        if flag is None:
+            return
+        enabled = bool(flag.get())
+        if enabled:
+            for key, other in self.transform_flags_iv.items():
+                if key != mode:
+                    other.set(False)
+            self.transform_mode_var_iv.set(mode)
+        else:
+            self.transform_mode_var_iv.set("none")
+        self._update_transform_controls()
+        self._refresh_graph()
+        self._save_config()
+
+    def _update_transform_controls(self) -> None:
+        mode = self.transform_mode_var_iv.get()
+        x_combo = self._iv_axis_controls.get("x_combo")
+        y_combo = self._iv_axis_controls.get("y_combo")
+        logx = self._iv_axis_controls.get("logx")
+        logy = self._iv_axis_controls.get("logy")
+
+        if isinstance(x_combo, ttk.Combobox):
+            if mode == "none":
+                x_combo.state(["!disabled"])
+                x_combo.configure(state="readonly")
+            else:
+                x_combo.state(["disabled"])
+        if isinstance(y_combo, ttk.Combobox):
+            if mode == "none":
+                y_combo.state(["!disabled"])
+                y_combo.configure(state="readonly")
+            else:
+                y_combo.state(["disabled"])
+        if isinstance(logx, ttk.Checkbutton):
+            if mode == "none":
+                logx.state(["!disabled"])
+            else:
+                logx.state(["disabled"])
+        if isinstance(logy, ttk.Checkbutton):
+            if mode == "none":
+                logy.state(["!disabled"])
+            else:
+                logy.state(["disabled"])
+
+        if mode != "none":
+            for key, flag in self.transform_flags_iv.items():
+                flag.set(key == mode)
+            self.logx_var_iv.set(False)
+            self.logy_var_iv.set(False)
+        if self.graph_iv is not None:
+            self.graph_iv.set_transform(mode if mode != "none" else "none")
+
+    def _auto_mode_labels(self) -> Dict[str, str]:
+        return {
+            "manual": "手动设置",
+            "from_step": "按步长算点数",
+            "from_points": "按点数算步进",
+        }
+
+    def _on_auto_mode_changed(self) -> None:
+        label = self._auto_mode_display_var.get()
+        reverse = {v: k for k, v in self._auto_mode_labels().items()}
+        code = reverse.get(label, "manual")
+        self.auto_points_mode_var.set(code)
+        self._update_auto_entry_states()
+        self._refresh_auto_calculation()
+        self._save_config()
+
+    def _update_auto_entry_states(self) -> None:
+        mode = self.auto_points_mode_var.get()
+        if self._step_entry is not None:
+            if mode == "from_points":
+                self._step_entry.state(["disabled"])
+            else:
+                self._step_entry.state(["!disabled"])
+        if self._points_entry is not None:
+            if mode == "from_step":
+                self._points_entry.state(["disabled"])
+            else:
+                self._points_entry.state(["!disabled"])
+
+    def _refresh_auto_calculation(self) -> None:
+        if self._auto_calc_label is None:
+            return
+        mode_labels = self._auto_mode_labels()
+        self._auto_mode_display_var.set(mode_labels.get(self.auto_points_mode_var.get(), mode_labels["manual"]))
+        self._update_auto_entry_states()
+        try:
+            s = self.instrument.settings
+            start_from = self.sweep_start_var.get()
+            if start_from == "从零点":
+                origin, dest = 0.0, float(s.stop_level)
+            elif start_from == "从终点":
+                origin, dest = float(s.stop_level), float(s.start_level)
+            else:
+                origin, dest = float(s.start_level), float(s.stop_level)
+            span = dest - origin
+            mode = self.auto_points_mode_var.get()
+            if mode == "from_step":
+                step = float(s.step)
+                if math.isclose(step, 0.0, rel_tol=1e-9, abs_tol=1e-12):
+                    self._auto_calc_label.config(text="自动点数：步进为 0")
+                    return
+                n_base = int(abs(span / step)) + 1 if not math.isclose(step, 0.0, abs_tol=1e-15) else 1
+                n_display = n_base
+                if self.sweep_traj_var.get().startswith("往返") and n_base > 1:
+                    n_display = n_base * 2 - 1
+                self._auto_calc_label.config(text=f"自动点数：{n_display}")
+                if self._points_entry is not None:
+                    was_disabled = self._points_entry.instate(["disabled"])
+                    if was_disabled:
+                        self._points_entry.state(["!disabled"])
+                    self._points_entry.delete(0, tk.END)
+                    self._points_entry.insert(0, str(n_base))
+                    if was_disabled:
+                        self._points_entry.state(["disabled"])
+                s.sweep_points = n_base
+            elif mode == "from_points":
+                points = max(int(s.sweep_points), 1)
+                if points <= 1 or math.isclose(span, 0.0, abs_tol=1e-15):
+                    step = 0.0
+                    self._auto_calc_label.config(text="自动步进：范围为 0")
+                else:
+                    step = span / (points - 1)
+                    direction = 1 if dest >= origin else -1
+                    if direction > 0 and step < 0: step = abs(step)
+                    if direction < 0 and step > 0: step = -abs(step)
+                    self._auto_calc_label.config(text=f"自动步进：{fmt_e(step, 3)}")
+                if self._step_entry is not None:
+                    was_disabled = self._step_entry.instate(["disabled"])
+                    if was_disabled:
+                        self._step_entry.state(["!disabled"])
+                    self._step_entry.delete(0, tk.END)
+                    self._step_entry.insert(0, f"{step}")
+                    if was_disabled:
+                        self._step_entry.state(["disabled"])
+                s.step = float(step)
+            else:
+                self._auto_calc_label.config(text="自动计算：--")
+                return
+        except Exception:
+            self._auto_calc_label.config(text="自动计算：--")
+            return
+        self._save_config()
 
     # ----------------------- Right: Vt/It tabs (grid) -------------------
     def _build_time_tab(self, parent: ttk.Frame, *, mode: str) -> None:
@@ -849,41 +1089,53 @@ class MeasurementApp(tk.Tk):
         ttk.Label(sw, text="轨迹").grid(row=0, column=0, sticky="w", padx=6, pady=3)
         traj = ttk.Combobox(sw, state="readonly", width=12, values=["单向", "往返(Up/Down)"], textvariable=self.sweep_traj_var)
         traj.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        traj.bind("<<ComboboxSelected>>", lambda _e: (self._save_config(), self._refresh_auto_calculation()))
 
         ttk.Label(sw, text="起始位置").grid(row=0, column=2, sticky="e", padx=6, pady=3)
         start_from = ttk.Combobox(sw, state="readonly", width=12, values=["从起点", "从终点", "从零点"], textvariable=self.sweep_start_var)
         start_from.grid(row=0, column=3, sticky="ew", padx=6, pady=3)
+        start_from.bind("<<ComboboxSelected>>", lambda _e: (self._save_config(), self._refresh_auto_calculation()))
 
         # row1~
-        ttk.Checkbutton(sw, text="点数自动设置", variable=self.auto_points_var, command=lambda: self._toggle_points_auto(points_entry, points_val)).grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        ttk.Label(sw, text="点数计算").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        auto_options = [
+            "手动设置",
+            "按步长算点数",
+            "按点数算步进",
+        ]
+        auto_combo = ttk.Combobox(sw, textvariable=self._auto_mode_display_var, state="readonly", values=auto_options, width=16)
+        auto_combo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        auto_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_auto_mode_changed())
 
         ttk.Label(sw, text="起始值").grid(row=2, column=0, sticky="w", padx=6, pady=3)
         start_e = ttk.Entry(sw, width=12); start_e.insert(0, str(self.instrument.settings.start_level))
         start_e.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
-        start_e.bind("<FocusOut>", lambda e: (self._update_numeric_setting("start_level", start_e.get()), self._recalc_points(points_val)))
+        start_e.bind("<FocusOut>", lambda e: (self._update_numeric_setting("start_level", start_e.get()), self._refresh_auto_calculation()))
 
         ttk.Label(sw, text="终止值").grid(row=2, column=2, sticky="e", padx=6, pady=3)
         stop_e = ttk.Entry(sw, width=12); stop_e.insert(0, str(self.instrument.settings.stop_level))
         stop_e.grid(row=2, column=3, sticky="ew", padx=6, pady=3)
-        stop_e.bind("<FocusOut>", lambda e: (self._update_numeric_setting("stop_level", stop_e.get()), self._recalc_points(points_val)))
+        stop_e.bind("<FocusOut>", lambda e: (self._update_numeric_setting("stop_level", stop_e.get()), self._refresh_auto_calculation()))
 
         ttk.Label(sw, text="步进").grid(row=3, column=0, sticky="w", padx=6, pady=3)
         step_e = ttk.Entry(sw, width=12); step_e.insert(0, str(self.instrument.settings.step))
         step_e.grid(row=3, column=1, sticky="ew", padx=6, pady=3)
-        step_e.bind("<FocusOut>", lambda e: (self._update_numeric_setting("step", step_e.get()), self._recalc_points(points_val)))
+        step_e.bind("<FocusOut>", lambda e: (self._update_numeric_setting("step", step_e.get()), self._refresh_auto_calculation()))
 
         ttk.Label(sw, text="点数").grid(row=3, column=2, sticky="e", padx=6, pady=3)
         points_entry = ttk.Entry(sw, width=12); points_entry.insert(0, str(self.instrument.settings.sweep_points))
         points_entry.grid(row=3, column=3, sticky="ew", padx=6, pady=3)
-        points_entry.bind("<FocusOut>", lambda e: self._update_numeric_setting("sweep_points", points_entry.get()))
+        points_entry.bind("<FocusOut>", lambda e: (self._update_numeric_setting("sweep_points", points_entry.get()), self._refresh_auto_calculation()))
 
         points_val = ttk.Label(sw, text="自动点数：--", foreground="#777")
         points_val.grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 3))
 
         for c in (1, 3):
             sw.columnconfigure(c, weight=1)
-        self._toggle_points_auto(points_entry, points_val)
-        self._recalc_points(points_val)
+        self._points_entry = points_entry
+        self._step_entry = step_e
+        self._auto_calc_label = points_val
+        self._refresh_auto_calculation()
 
     def _build_cycle_settings(self, parent: ttk.Frame) -> None:
         cyc = ttk.LabelFrame(parent, text="循环控制", style="White.TFrame")
@@ -1116,13 +1368,33 @@ class MeasurementApp(tk.Tk):
             remain_s = remaining_pts / rate
             self.eta_var.set(f"剩余 {remain_s:.1f}s")
 
-    def _active_axis_labels(self) -> Tuple[str, str, bool, bool]:
+    def _active_axis_labels(self) -> Tuple[str, str, bool, bool, str]:
         if self._active_mode == "IV":
-            return self.x_axis_var_iv.get(), self.y_axis_var_iv.get(), self.logx_var_iv.get(), self.logy_var_iv.get()
-        elif self._active_mode == "Vt":
-            return self.x_axis_var_vt.get(), self.y_axis_var_vt.get(), self.logx_var_vt.get(), self.logy_var_vt.get()
-        else:
-            return self.x_axis_var_it.get(), self.y_axis_var_it.get(), self.logx_var_it.get(), self.logy_var_it.get()
+            transform = self.transform_mode_var_iv.get()
+            if transform != "none":
+                return "电压 (V)", "电流 (A)", False, False, transform
+            return (
+                self.x_axis_var_iv.get(),
+                self.y_axis_var_iv.get(),
+                self.logx_var_iv.get(),
+                self.logy_var_iv.get(),
+                "none",
+            )
+        if self._active_mode == "Vt":
+            return (
+                self.x_axis_var_vt.get(),
+                self.y_axis_var_vt.get(),
+                self.logx_var_vt.get(),
+                self.logy_var_vt.get(),
+                "none",
+            )
+        return (
+            self.x_axis_var_it.get(),
+            self.y_axis_var_it.get(),
+            self.logx_var_it.get(),
+            self.logy_var_it.get(),
+            "none",
+        )
 
     def _refresh_graph(self) -> None:
         if self.graph_active is None:
@@ -1130,8 +1402,10 @@ class MeasurementApp(tk.Tk):
             elif self._active_mode == "Vt": self.graph_active = self.graph_vt
             else: self.graph_active = self.graph_it
         if self.graph_active is None: return
-        xlbl, ylbl, logx, logy = self._active_axis_labels()
-        self.graph_active.set_log(logx, logy); self.graph_active.set_data(self.measurements, x_axis=xlbl, y_axis=ylbl)
+        xlbl, ylbl, logx, logy, transform = self._active_axis_labels()
+        self.graph_active.set_transform(transform)
+        self.graph_active.set_log(logx, logy)
+        self.graph_active.set_data(self.measurements, x_axis=xlbl, y_axis=ylbl)
 
     def _update_summary(self) -> None:
         if not self.measurements:
@@ -1164,22 +1438,41 @@ class MeasurementApp(tk.Tk):
         else:
             origin = float(s.start_level); dest = float(s.stop_level)
 
+        mode = self.auto_points_mode_var.get()
         step = float(s.step)
-        if math.isclose(step, 0.0, rel_tol=1e-9, abs_tol=1e-12):
-            if not self.auto_points_var.get():
-                if max(int(s.sweep_points), 1) == 1: step = 0.0
-                else: step = (dest - origin) / max(int(s.sweep_points) - 1, 1)
+        points = max(int(s.sweep_points), 1)
+        span = dest - origin
+        if mode == "from_points":
+            if points <= 1 or math.isclose(span, 0.0, abs_tol=1e-15):
+                step = 0.0
             else:
-                step = (dest - origin) / 10.0 if not math.isclose(dest, origin, abs_tol=1e-15) else 1.0
+                step = span / (points - 1)
+        elif mode == "from_step":
+            if math.isclose(step, 0.0, rel_tol=1e-9, abs_tol=1e-12):
+                if math.isclose(span, 0.0, abs_tol=1e-15):
+                    step = 0.0
+                else:
+                    step = span / 10.0
+        else:  # manual
+            if math.isclose(step, 0.0, rel_tol=1e-9, abs_tol=1e-12):
+                if points <= 1 or math.isclose(span, 0.0, abs_tol=1e-15):
+                    step = 0.0
+                else:
+                    step = span / max(points - 1, 1)
 
         direction = 1 if dest >= origin else -1
         if direction > 0 and step < 0: step = abs(step)
         if direction < 0 and step > 0: step = -abs(step)
 
-        if self.auto_points_var.get():
-            n = int(abs((dest - origin) / step)) + 1 if not math.isclose(step, 0.0, abs_tol=1e-15) else 1
+        if mode == "from_step":
+            if math.isclose(step, 0.0, abs_tol=1e-15):
+                n = 1
+            else:
+                n = int(abs(span / step)) + 1
         else:
-            n = max(int(s.sweep_points), 1)
+            n = points
+        if n <= 0:
+            n = 1
 
         if n <= 1 or math.isclose(dest, origin, abs_tol=1e-15):
             base = [origin]
@@ -1192,30 +1485,6 @@ class MeasurementApp(tk.Tk):
             base = base + back
 
         return base
-
-    def _toggle_points_auto(self, entry: ttk.Entry, label: ttk.Label) -> None:
-        entry.state(["disabled"] if self.auto_points_var.get() else ["!disabled"])
-        self._recalc_points(label); self._save_config()
-
-    def _recalc_points(self, label: ttk.Label) -> None:
-        try:
-            s = self.instrument.settings
-            start_from = self.sweep_start_var.get()
-            if start_from == "从零点":
-                origin, dest = 0.0, float(s.stop_level)
-            elif start_from == "从终点":
-                origin, dest = float(s.stop_level), float(s.start_level)
-            else:
-                origin, dest = float(s.start_level), float(s.stop_level)
-            step = float(s.step)
-            if math.isclose(step, 0.0, rel_tol=1e-9, abs_tol=1e-12):
-                label.config(text="自动点数：步进为 0"); return
-            n = int(abs((dest - origin) / step)) + 1
-            if self.sweep_traj_var.get().startswith("往返") and n > 1:
-                n = n * 2 - 1
-            label.config(text=f"自动点数：{n}")
-        except Exception:
-            label.config(text="自动点数：--")
 
     # ----------------------------- files --------------------------------
     def select_directory(self) -> None:
@@ -1262,13 +1531,14 @@ class MeasurementApp(tk.Tk):
                     "sample_name": self.sample_name_var.get(),
                     "operator": self.operator_var.get(),
                     "mode": self._active_mode,
-                    "auto_points": self.auto_points_var.get(),
+                    "auto_points_mode": self.auto_points_mode_var.get(),
                     "filter_enable": self.filter_enable_var.get(),
                     "filter_window": int(self.filter_window_var.get()),
                     "cycle_count": int(self.cycle_count_var.get()),
                     "cycle_interval": float(self.cycle_interval_var.get()),
                     "sweep_traj": self.sweep_traj_var.get(),
                     "sweep_start": self.sweep_start_var.get(),
+                    "transform_mode_iv": self.transform_mode_var_iv.get(),
                     "axes": {
                         "iv": [self.x_axis_var_iv.get(), self.y_axis_var_iv.get(), self.logx_var_iv.get(), self.logy_var_iv.get()],
                         "vt": [self.x_axis_var_vt.get(), self.y_axis_var_vt.get(), self.logx_var_vt.get(), self.logy_var_vt.get()],
@@ -1295,13 +1565,22 @@ class MeasurementApp(tk.Tk):
                 self.sample_name_var.set(ui.get("sample_name", "Sample-001"))
                 self.operator_var.set(ui.get("operator", "Operator"))
                 self._active_mode = ui.get("mode", "IV")
-                self.auto_points_var.set(ui.get("auto_points", True))
+                mode = ui.get("auto_points_mode", "from_step")
+                if mode not in self._auto_mode_labels():
+                    mode = "from_step"
+                self.auto_points_mode_var.set(mode)
                 self.filter_enable_var.set(ui.get("filter_enable", False))
                 self.filter_window_var.set(int(ui.get("filter_window", 5)))
                 self.cycle_count_var.set(int(ui.get("cycle_count", 1)))
                 self.cycle_interval_var.set(float(ui.get("cycle_interval", 0.0)))
                 self.sweep_traj_var.set(ui.get("sweep_traj", "单向"))
                 self.sweep_start_var.set(ui.get("sweep_start", "从起点"))
+                transform_mode = ui.get("transform_mode_iv", "none")
+                if transform_mode not in self.transform_flags_iv and transform_mode != "none":
+                    transform_mode = "none"
+                self.transform_mode_var_iv.set(transform_mode)
+                for key, flag in self.transform_flags_iv.items():
+                    flag.set(key == transform_mode)
                 axes = ui.get("axes", {})
                 if "iv" in axes:
                     self.x_axis_var_iv.set(axes["iv"][0]); self.y_axis_var_iv.set(axes["iv"][1])
@@ -1315,6 +1594,8 @@ class MeasurementApp(tk.Tk):
                 self._log("已加载上次配置")
             except Exception as exc:
                 self._log(f"加载配置失败：{exc}")
+        self._update_transform_controls()
+        self._refresh_auto_calculation()
         self._refresh_graph()
 
         # update resource list quickly (no IDN for UI), then try 2636B autoconnect
