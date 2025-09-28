@@ -1,49 +1,31 @@
-# 2636B Measurement Software Replica
+# 2636B Measurement Controller
 
-This repository contains a standalone desktop application that reproduces the
-workflow shown in the supplied screenshots for a Keithley 2636B control
-program.  The implementation focuses on matching the layout and user
-experience while providing a fully functional simulation back-end so the
-software can be demonstrated without lab hardware.
+A standalone desktop control app for Keithley 2636B source meters that mirrors
+the reference workflow. It supports **real hardware via PyVISA** and a
+**deterministic simulator** for offline use. The UI is built with the Python
+standard library toolkit (Tkinter), so it runs out of the box.
 
-## Features
+## Key Capabilities
 
-* Multi-tab interface for I/V sweeps, time-domain tests and utility pages.
-* Fully simulated instrument driver with deterministic synthetic data.
-* Canvas-based chart replicating the grid and trace appearance from the
-  original application.
-* Measurement results table with live updates, averaging and auto-save.
-* Parameter panels for source settings, sweep ranges, compliance limits and
-  logging.
-* Export utilities for saving captured data (CSV) and measurement
-  configuration (JSON).
+- **Direct instrument connectivity** – scan VISA resources, show identity
+  strings, and open a live session with a 2636B (or compatible) sourcemeter.
+- **Deterministic simulator fallback** – when no hardware is present, the
+  built-in model provides repeatable synthetic measurements.
+- **Robust sweep execution** – sequencing respects sweep direction, trigger
+  delays, compliance limits, point counts, and user timing.
+- **Dynamic charting** – selectable axes (index, time, voltage, current,
+  resistance, power) with auto-scaling and readable ticks.
+- **Results & data handling** – live statistics, auto log updates, CSV export,
+  JSON configuration export, and optional auto-save snapshots.
 
-## Running the Application
+## Requirements
 
-The program only depends on the Python standard library.  Launch it directly:
+- Python 3.9 or newer
+- Tkinter (bundled with most Python distributions)
+- Optional: [PyVISA](https://pyvisa.readthedocs.io/) and a VISA backend
+  (e.g., NI-VISA) to communicate with real instruments
+
+Install PyVISA if you plan to use hardware control:
 
 ```bash
-python main.py
-```
-
-When the UI opens:
-
-1. Click **连接仪器** to attach the simulated source meter.
-2. Configure sweep parameters from the panels on the right.
-3. Press **开始** to start collecting samples.  The graph and table update in
-   real time until all sweep points are acquired or **停止** is pressed.
-4. Save the generated dataset or export configuration files using the buttons
-   in the left sidebar.
-
-All measurement points are produced by a deterministic mathematical model, so
-repeat runs using the same settings yield reproducible curves and statistics.
-
-## Repository Layout
-
-```
-main.py    - GUI application entry point
-README.md  - Project overview and instructions
-```
-
-The codebase was kept intentionally compact to emphasise clarity and ease of
-modification.
+pip install pyvisa

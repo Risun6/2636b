@@ -26,7 +26,113 @@ import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    import pyvisa
+    from pyvisa import VisaIOError
+except Exception:  # pragma: no cover - pyvisa may be unavailable on CI
+    pyvisa = None  # type: ignore[assignment]
+    VisaIOError = Exception  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Instrument abstractions
+# ---------------------------------------------------------------------------
+
+
+class InstrumentError(RuntimeError):
+    """Base class for instrument related failures."""
+
+
+@dataclass
+class VisaResourceInfo:
+    """Metadata discovered during VISA resource scanning."""
+
+    resource: str
+    idn: str = ""
+    alias: Optional[str] = None
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    serial: Optional[str] = None
+    firmware: Optional[str] = None
+
+    def display_name(self) -> str:
+        if self.model:
+            base = self.model
+        elif self.alias:
+            base = self.alias
+        else:
+            base = self.resource
+        details = []
+        if self.serial:
+            details.append(f"SN {self.serial}")
+        if self.idn:
+            details.append(self.idn)
+        info = " | ".join(details)
+        return f"{base} ({self.resource})" if not info else f"{base} ({info})"
+
+
+# ---------------------------------------------------------------------------
+# VISA discovery helper
+# ---------------------------------------------------------------------------
+
+
+def discover_visa_resources(timeout: float = 0.5) -> List[VisaResourceInfo]:
+    """Scan connected VISA resources and collect identity information."""
+
+    if pyvisa is None:
+        return []
+
+    resources: List[VisaResourceInfo] = []
+    try:
+        rm = pyvisa.ResourceManager()  # type: ignore[call-arg]
+    except Exception:  # pragma: no cover - dependent on VISA installation
+        return resources
+
+    try:
+        for resource_name in rm.list_resources():
+            info = VisaResourceInfo(resource=resource_name)
+            session = None
+            try:
+                session = rm.open_resource(resource_name)
+                session.timeout = int(timeout * 1000)
+                try:
+                    alias = rm.resource_info(resource_name).alias
+                    info.alias = alias or None
+                except Exception:
+                    info.alias = None
+                try:
+                    idn = session.query("*IDN?").strip()
+                except Exception:
+                    idn = ""
+                info.idn = idn
+                if idn:
+                    parts = [part.strip() for part in idn.split(",")]
+                    if parts:
+                        info.manufacturer = parts[0]
+                    if len(parts) > 1:
+                        info.model = parts[1]
+                    if len(parts) > 2:
+                        info.serial = parts[2]
+                    if len(parts) > 3:
+                        info.firmware = parts[3]
+            except Exception:
+                pass
+            finally:
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+            resources.append(info)
+    finally:
+        try:
+            rm.close()
+        except Exception:
+            pass
+
+    return resources
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +190,7 @@ class InstrumentSimulator:
         self._is_connected = False
         self._start_time: Optional[_dt.datetime] = None
         self._seed = random.Random(2636)
+        self._last_level: float = 0.0
 
     # ------------------------------------------------------------------
     # Instrument management
@@ -104,19 +211,32 @@ class InstrumentSimulator:
     # ------------------------------------------------------------------
     # Measurement routine
     # ------------------------------------------------------------------
+    def prepare_measurement(self, setpoints: Sequence[float]) -> None:
+        self._last_level = setpoints[0] if setpoints else 0.0
+        self.start_measurement()
+
     def start_measurement(self) -> None:
         if not self._is_connected:
             raise RuntimeError("Instrument not connected")
         self._start_time = _dt.datetime.now()
 
-    def generate_point(self, index: int) -> MeasurementPoint:
+    def generate_point(self, index: int, level: Optional[float] = None) -> MeasurementPoint:
         if self._start_time is None:
             self._start_time = _dt.datetime.now()
 
-        elapsed = (index - 1) * self.settings.step
-        angle = (elapsed / max(self.settings.stop_level - self.settings.start_level, 0.1)) * math.tau
-        base_voltage = math.sin(angle) * 5
-        base_current = math.cos(angle) * 0.01
+        if level is None:
+            level = self.settings.start_level + (index - 1) * self.settings.step
+        self._last_level = level
+
+        elapsed = abs(level - self.settings.start_level)
+        angle = (elapsed / max(abs(self.settings.stop_level - self.settings.start_level), 0.1)) * math.tau
+
+        if self.settings.mode == "电流源":
+            base_current = level
+            base_voltage = math.sin(angle) * 5 + base_current * 200
+        else:
+            base_voltage = level
+            base_current = math.cos(angle) * 0.01 + base_voltage / 200
 
         noise_v = self._seed.uniform(-0.05, 0.05)
         noise_i = self._seed.uniform(-0.0002, 0.0002)
@@ -124,8 +244,152 @@ class InstrumentSimulator:
         voltage = base_voltage + noise_v
         current = base_current + noise_i
 
-        timestamp = self._start_time + _dt.timedelta(seconds=elapsed)
+        timestamp = self._start_time + _dt.timedelta(seconds=max(elapsed * 0.1, 0.1))
         return MeasurementPoint(index=index, timestamp=timestamp, voltage=voltage, current=current)
+
+    def finalize_measurement(self) -> None:
+        self._last_level = 0.0
+        self._start_time = None
+
+    def abort_measurement(self) -> None:
+        self.finalize_measurement()
+
+
+class VisaInstrument:
+    """PyVISA based controller for a physical 2636B instrument."""
+
+    def __init__(self, info: VisaResourceInfo, *, timeout: float = 10.0) -> None:
+        self.settings = InstrumentSettings()
+        self.info = info
+        self.timeout = timeout
+        self._rm: Optional["pyvisa.ResourceManager"] = None
+        self._resource: Optional["pyvisa.resources.Resource"] = None
+        self._is_connected = False
+        self._channel = "smua"
+
+    # ------------------------------------------------------------------
+    def connect(self) -> None:
+        if pyvisa is None:
+            raise InstrumentError("未安装 PyVISA，无法连接真实仪器")
+        try:
+            self._rm = pyvisa.ResourceManager()  # type: ignore[call-arg]
+            self._resource = self._rm.open_resource(self.info.resource)
+            self._resource.timeout = int(self.timeout * 1000)
+            self._resource.write("*CLS")
+            self._resource.write("format.data = format.ASCII")
+            self._resource.write("format.asciiprecision = 6")
+            self._resource.write("format.asciiexponent = 3")
+            self._is_connected = True
+        except Exception as exc:  # pragma: no cover - hardware specific
+            raise InstrumentError(f"连接仪器失败: {exc}") from exc
+
+    def disconnect(self) -> None:
+        try:
+            self.abort_measurement()
+        finally:
+            if self._resource is not None:
+                try:
+                    self._resource.close()
+                except Exception:
+                    pass
+            if self._rm is not None:
+                try:
+                    self._rm.close()
+                except Exception:
+                    pass
+            self._resource = None
+            self._rm = None
+            self._is_connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
+
+    # ------------------------------------------------------------------
+    def _write(self, command: str) -> None:
+        if self._resource is None:
+            raise InstrumentError("仪器未连接")
+        try:
+            self._resource.write(command)
+        except VisaIOError as exc:  # pragma: no cover - hardware specific
+            raise InstrumentError(f"仪器通信失败: {exc}") from exc
+
+    def _query(self, command: str) -> str:
+        if self._resource is None:
+            raise InstrumentError("仪器未连接")
+        try:
+            return str(self._resource.query(command)).strip()
+        except VisaIOError as exc:  # pragma: no cover - hardware specific
+            raise InstrumentError(f"仪器通信失败: {exc}") from exc
+
+    def _channel_name(self) -> str:
+        return "smua" if self.settings.channel == "Channel A" else "smub"
+
+    def prepare_measurement(self, setpoints: Sequence[float]) -> None:
+        if not self._is_connected:
+            self.connect()
+        self._channel = self._channel_name()
+        self._write("errorqueue.clear()")
+        self._write("display.clear()")
+        self._write(f"{self._channel}.reset()")
+        self._write(f"{self._channel}.measure.nplc = {max(self.settings.nplc, 0.01)}")
+        self._write(f"{self._channel}.source.output = {self._channel}.OUTPUT_OFF")
+        if self.settings.mode == "电流源":
+            self._write(f"{self._channel}.source.func = {self._channel}.OUTPUT_DCAMPS")
+            if self.settings.autorange:
+                self._write(f"{self._channel}.source.autorangei = {self._channel}.AUTORANGE_ON")
+            else:
+                self._write(f"{self._channel}.source.autorangei = {self._channel}.AUTORANGE_OFF")
+            self._write(f"{self._channel}.source.limitv = {abs(self.settings.compliance_voltage)}")
+        else:
+            self._write(f"{self._channel}.source.func = {self._channel}.OUTPUT_DCVOLTS")
+            if self.settings.autorange:
+                self._write(f"{self._channel}.source.autorangev = {self._channel}.AUTORANGE_ON")
+            else:
+                self._write(f"{self._channel}.source.autorangev = {self._channel}.AUTORANGE_OFF")
+            self._write(f"{self._channel}.source.limiti = {abs(self.settings.compliance_voltage) / 1000.0}")
+
+        delay = max(self.settings.trigger_delay_ms / 1000.0, 0.0)
+        self._write(f"{self._channel}.source.delay = {delay}")
+        initial = setpoints[0] if setpoints else 0.0
+        if self.settings.mode == "电流源":
+            self._write(f"{self._channel}.source.leveli = {initial}")
+        else:
+            self._write(f"{self._channel}.source.levelv = {initial}")
+        self._write(f"{self._channel}.source.output = {self._channel}.OUTPUT_ON")
+
+    def generate_point(self, index: int, level: Optional[float] = None) -> MeasurementPoint:
+        if level is None:
+            level = self.settings.start_level + (index - 1) * self.settings.step
+        if self.settings.mode == "电流源":
+            self._write(f"{self._channel}.source.leveli = {level}")
+        else:
+            self._write(f"{self._channel}.source.levelv = {level}")
+        query = (
+            "print(string.format('%e,%e', "
+            f"{self._channel}.measure.v(), {self._channel}.measure.i()))"
+        )
+        response = self._query(query)
+        try:
+            voltage_str, current_str = response.split(",")
+            voltage = float(voltage_str)
+            current = float(current_str)
+        except Exception as exc:  # pragma: no cover - parse failure unlikely
+            raise InstrumentError(f"无法解析仪器返回数据: {response}") from exc
+        timestamp = _dt.datetime.now()
+        return MeasurementPoint(index=index, timestamp=timestamp, voltage=voltage, current=current)
+
+    def finalize_measurement(self) -> None:
+        try:
+            self._write(f"{self._channel}.source.output = {self._channel}.OUTPUT_OFF")
+        except InstrumentError:
+            pass
+
+    def abort_measurement(self) -> None:
+        try:
+            self._write(f"{self._channel}.source.output = {self._channel}.OUTPUT_OFF")
+        except InstrumentError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +397,16 @@ class InstrumentSimulator:
 # ---------------------------------------------------------------------------
 
 class SweepGraph(ttk.Frame):
-    """Simple canvas based plot that mimics the layout in the screenshots."""
+    """Canvas based plot with configurable axes and robust scaling."""
+
+    AXIS_FIELDS: Dict[str, Tuple[str, str]] = {
+        "序号": ("index", ""),
+        "时间 (s)": ("time", "s"),
+        "电压 (V)": ("voltage", "V"),
+        "电流 (A)": ("current", "A"),
+        "电阻 (Ω)": ("resistance", "Ω"),
+        "功率 (W)": ("power", "W"),
+    }
 
     def __init__(self, master: tk.Widget, *, width: int = 840, height: int = 320) -> None:
         super().__init__(master)
@@ -141,30 +414,108 @@ class SweepGraph(ttk.Frame):
         self.height = height
         self.canvas = tk.Canvas(self, width=width, height=height, background="#ffffff", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.margin = 40
+        self.margin = 50
+        self.axis_choices = list(self.AXIS_FIELDS.keys())
+        self._x_axis_label = "电压 (V)"
+        self._y_axis_label = "电流 (A)"
         self._data: List[Tuple[float, float]] = []
-        self._x_range = (0.0, 10.0)
+        self._raw_points: List[MeasurementPoint] = []
+        self._x_range = (0.0, 1.0)
         self._y_range = (-1.0, 1.0)
+        self._time_reference: Optional[_dt.datetime] = None
         self.canvas.bind("<Configure>", lambda event: self.redraw())
         self.redraw()
 
     # ------------------------------------------------------------------
-    def set_data(self, points: Iterable[MeasurementPoint], *, x_axis: str = "Voltage", y_axis: str = "Current") -> None:
-        processed = []
-        for point in points:
-            x_value = point.voltage if x_axis == "Voltage" else point.index
-            y_value = point.current if y_axis == "Current" else getattr(point, y_axis.lower(), point.current)
-            processed.append((x_value, y_value))
-        self._data = processed
-        if processed:
-            xs, ys = zip(*processed)
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            pad_x = (max_x - min_x) * 0.1 or 1
-            pad_y = (max_y - min_y) * 0.1 or 1
-            self._x_range = (min_x - pad_x, max_x + pad_x)
-            self._y_range = (min_y - pad_y, max_y + pad_y)
+    def set_data(
+        self,
+        points: Iterable[MeasurementPoint],
+        *,
+        x_axis: Optional[str] = None,
+        y_axis: Optional[str] = None,
+    ) -> None:
+        if x_axis is not None:
+            self._x_axis_label = x_axis
+        if y_axis is not None:
+            self._y_axis_label = y_axis
+
+        self._raw_points = list(points)
+        self._time_reference = None
+        self._data = []
+
+        x_field = self.AXIS_FIELDS.get(self._x_axis_label, ("index", ""))[0]
+        y_field = self.AXIS_FIELDS.get(self._y_axis_label, ("current", "A"))[0]
+        for point in self._raw_points:
+            x_value = self._value_from_point(point, x_field)
+            y_value = self._value_from_point(point, y_field)
+            if not (self._is_valid_number(x_value) and self._is_valid_number(y_value)):
+                continue
+            self._data.append((x_value, y_value))
+
+        if self._data:
+            xs, ys = zip(*self._data)
+            self._x_range = self._expand_range(min(xs), max(xs))
+            self._y_range = self._expand_range(min(ys), max(ys))
+        else:
+            self._x_range = (0.0, 1.0)
+            self._y_range = (-1.0, 1.0)
         self.redraw()
+
+    # ------------------------------------------------------------------
+    def _value_from_point(self, point: MeasurementPoint, field: str) -> float:
+        if field == "index":
+            return float(point.index)
+        if field == "time":
+            if self._time_reference is None:
+                self._time_reference = point.timestamp
+            return (point.timestamp - self._time_reference).total_seconds()
+        value = getattr(point, field, None)
+        if value is None:
+            return float("nan")
+        return float(value)
+
+    def _is_valid_number(self, value: float) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+    def _expand_range(self, vmin: float, vmax: float) -> Tuple[float, float]:
+        if not math.isfinite(vmin) or not math.isfinite(vmax):
+            return (-1.0, 1.0)
+        if math.isclose(vmin, vmax, rel_tol=1e-9, abs_tol=1e-12):
+            pad = abs(vmin) * 0.05 or 1.0
+            return (vmin - pad, vmax + pad)
+        span = vmax - vmin
+        pad = span * 0.1 or 1.0
+        return (vmin - pad, vmax + pad)
+
+    def _nice_number(self, value: float) -> float:
+        if value <= 0:
+            return 1.0
+        exponent = math.floor(math.log10(value))
+        fraction = value / (10 ** exponent)
+        if fraction < 1.5:
+            nice_fraction = 1.0
+        elif fraction < 3.0:
+            nice_fraction = 2.0
+        elif fraction < 7.0:
+            nice_fraction = 5.0
+        else:
+            nice_fraction = 10.0
+        return nice_fraction * (10 ** exponent)
+
+    def _generate_ticks(self, vmin: float, vmax: float, *, count: int = 6) -> List[Tuple[float, str]]:
+        if not math.isfinite(vmin) or not math.isfinite(vmax):
+            return []
+        if math.isclose(vmax, vmin, rel_tol=1e-9, abs_tol=1e-12):
+            vmax = vmin + 1.0
+        span = vmax - vmin
+        step = self._nice_number(span / max(count - 1, 1))
+        start = math.floor(vmin / step) * step
+        ticks: List[Tuple[float, str]] = []
+        value = start
+        while value <= vmax + step * 0.5:
+            ticks.append((value, f"{value:.3g}"))
+            value += step
+        return ticks
 
     # ------------------------------------------------------------------
     def redraw(self) -> None:
@@ -177,31 +528,35 @@ class SweepGraph(ttk.Frame):
         plot_right = width - margin
         plot_bottom = height - margin
 
-        # Background grid
-        self.canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bottom, outline="#8d8d8d")
-        for i in range(10):
-            y = plot_top + (plot_bottom - plot_top) * (i / 10)
-            self.canvas.create_line(plot_left, y, plot_right, y, fill="#e0e0e0")
-        for i in range(10):
-            x = plot_left + (plot_right - plot_left) * (i / 10)
-            self.canvas.create_line(x, plot_top, x, plot_bottom, fill="#e0e0e0")
+        self.canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bottom, outline="#a0a0a0")
 
-        # Axis labels
-        self.canvas.create_text(width / 2, height - margin / 3, text="电压 (V)")
-        self.canvas.create_text(margin / 3, height / 2, text="电流 (A)", angle=90)
+        self.canvas.create_text(width / 2, height - margin / 3, text=self._x_axis_label)
+        self.canvas.create_text(margin / 3, height / 2, text=self._y_axis_label, angle=90)
 
         if not self._data:
             self.canvas.create_text(width / 2, height / 2, text="尚未开始测量", fill="#888888")
             return
 
-        xs, ys = zip(*self._data)
         min_x, max_x = self._x_range
         min_y, max_y = self._y_range
-        span_x = max(max_x - min_x, 1e-9)
-        span_y = max(max_y - min_y, 1e-9)
+        span_x = max(max_x - min_x, 1e-12)
+        span_y = max(max_y - min_y, 1e-12)
+
+        x_ticks = self._generate_ticks(min_x, max_x)
+        y_ticks = self._generate_ticks(min_y, max_y)
+
+        for value, label in x_ticks:
+            position = plot_left + ((value - min_x) / span_x) * (plot_right - plot_left)
+            self.canvas.create_line(position, plot_top, position, plot_bottom, fill="#f0f0f0")
+            self.canvas.create_text(position, plot_bottom + 12, text=label, anchor="n", font=("Arial", 8))
+
+        for value, label in y_ticks:
+            position = plot_bottom - ((value - min_y) / span_y) * (plot_bottom - plot_top)
+            self.canvas.create_line(plot_left, position, plot_right, position, fill="#f0f0f0")
+            self.canvas.create_text(plot_left - 6, position, text=label, anchor="e", font=("Arial", 8))
 
         coordinates = []
-        for x_value, y_value in zip(xs, ys):
+        for x_value, y_value in self._data:
             x = plot_left + ((x_value - min_x) / span_x) * (plot_right - plot_left)
             y = plot_bottom - ((y_value - min_y) / span_y) * (plot_bottom - plot_top)
             coordinates.append((x, y))
@@ -212,7 +567,7 @@ class SweepGraph(ttk.Frame):
             self.canvas.create_line(x0, y0, x1, y1, fill="#0066cc", width=2)
 
         for x, y in coordinates:
-            self.canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#0066cc", outline="")
+            self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#0066cc", outline="")
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +583,7 @@ class MeasurementApp(tk.Tk):
         self.geometry("1280x720")
         self.minsize(1150, 650)
 
-        self.instrument = InstrumentSimulator()
+        self.instrument: InstrumentSimulator | VisaInstrument = InstrumentSimulator()
         self._measurement_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.measurements: List[MeasurementPoint] = []
@@ -240,6 +595,12 @@ class MeasurementApp(tk.Tk):
         self.device_status_var = tk.StringVar(value="未连接")
         self.auto_save_var = tk.BooleanVar(value=False)
         self.summary_var = tk.StringVar(value="准备就绪")
+        self.resource_var = tk.StringVar(value="内置模拟器")
+        self.resource_info_var = tk.StringVar(value="使用内置模拟器")
+        self._resource_map: Dict[str, VisaResourceInfo] = {}
+        self._current_setpoints: List[float] = []
+        self.x_axis_var = tk.StringVar(value="电压 (V)")
+        self.y_axis_var = tk.StringVar(value="电流 (A)")
 
         self._build_layout()
         self._configure_styles()
@@ -280,14 +641,25 @@ class MeasurementApp(tk.Tk):
         connection_frame = ttk.LabelFrame(parent, text="设备控制")
         connection_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
 
+        scan_btn = ttk.Button(connection_frame, text="扫描设备", command=self.scan_instruments)
+        scan_btn.pack(fill=tk.X, pady=(4, 2))
+
+        self.resource_combo = ttk.Combobox(connection_frame, textvariable=self.resource_var, state="readonly")
+        self.resource_combo.pack(fill=tk.X, pady=2)
+        self.resource_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_resource_selected())
+
+        ttk.Label(connection_frame, textvariable=self.resource_info_var, wraplength=200, foreground="#555555").pack(fill=tk.X, pady=(2, 6))
+
         connect_btn = ttk.Button(connection_frame, text="连接仪器", command=self.connect_instrument)
-        connect_btn.pack(fill=tk.X, pady=4)
+        connect_btn.pack(fill=tk.X, pady=2)
 
         disconnect_btn = ttk.Button(connection_frame, text="断开连接", command=self.disconnect_instrument)
-        disconnect_btn.pack(fill=tk.X, pady=4)
+        disconnect_btn.pack(fill=tk.X, pady=2)
 
         ttk.Label(connection_frame, text="仪器状态:").pack(anchor="w", pady=(6, 0))
         ttk.Label(connection_frame, textvariable=self.device_status_var, foreground="#3073b6", font=("Microsoft YaHei", 11, "bold")).pack(anchor="w")
+
+        self._update_resource_options([])
 
         # Measurement buttons
         measurement_frame = ttk.LabelFrame(parent, text="测量操作")
@@ -373,8 +745,22 @@ class MeasurementApp(tk.Tk):
         graph_frame = ttk.Frame(parent)
         graph_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
 
+        axis_bar = ttk.Frame(graph_frame)
+        axis_bar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(axis_bar, text="横轴:").pack(side=tk.LEFT)
+        x_combo = ttk.Combobox(axis_bar, textvariable=self.x_axis_var, state="readonly", width=14)
+        x_combo.pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(axis_bar, text="纵轴:").pack(side=tk.LEFT)
+        y_combo = ttk.Combobox(axis_bar, textvariable=self.y_axis_var, state="readonly", width=14)
+        y_combo.pack(side=tk.LEFT, padx=(2, 12))
+
         self.graph = SweepGraph(graph_frame)
+        x_combo.configure(values=self.graph.axis_choices)
+        y_combo.configure(values=self.graph.axis_choices)
         self.graph.pack(fill=tk.BOTH, expand=True)
+        x_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_graph())
+        y_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_graph())
+        self._refresh_graph()
 
         controls_frame = ttk.Frame(parent)
         controls_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -485,24 +871,86 @@ class MeasurementApp(tk.Tk):
     # ------------------------------------------------------------------
     # Instrument interaction helpers
     # ------------------------------------------------------------------
+    def _update_resource_options(self, resources: List[VisaResourceInfo]) -> None:
+        values = ["内置模拟器"]
+        self._resource_map = {}
+        for info in resources:
+            base_label = info.display_name()
+            candidate = base_label
+            suffix = 1
+            while candidate in values:
+                suffix += 1
+                candidate = f"{base_label} #{suffix}"
+            values.append(candidate)
+            self._resource_map[candidate] = info
+        self.resource_combo.configure(values=values)
+        if self.resource_var.get() not in values:
+            self.resource_var.set(values[0])
+        self._on_resource_selected()
+
+    def _on_resource_selected(self) -> None:
+        selection = self.resource_var.get()
+        if selection in self._resource_map:
+            info = self._resource_map[selection]
+            manufacturer = info.manufacturer or "未知厂商"
+            model = info.model or "未知型号"
+            serial = info.serial or "未提供序列号"
+            text = f"{manufacturer} {model}\n资源: {info.resource}\n序列号: {serial}"
+            self.resource_info_var.set(text)
+        else:
+            self.resource_info_var.set("使用内置模拟器")
+
+    def scan_instruments(self) -> None:
+        if pyvisa is None:
+            messagebox.showwarning("未检测到PyVISA", "需要安装 PyVISA 并配置 NI-VISA 才能连接真实仪器。")
+            return
+        self.summary_var.set("正在扫描仪器...")
+        self.update_idletasks()
+        resources = discover_visa_resources()
+        if not resources:
+            self.summary_var.set("未发现VISA设备，已切换至模拟器")
+            messagebox.showinfo("扫描结果", "未发现可用的 VISA 设备，仍可使用内置模拟器进行演示。")
+            self._log("未发现任何 VISA 设备，继续使用模拟器")
+        else:
+            self.summary_var.set(f"发现 {len(resources)} 台可用设备")
+            self._log(f"扫描到设备: {', '.join(info.display_name() for info in resources)}")
+        self._update_resource_options(resources)
+
     def connect_instrument(self) -> None:
         if self.instrument.is_connected:
             messagebox.showinfo("提示", "仪器已连接")
             return
+        selection = self.resource_var.get()
+        if selection in self._resource_map:
+            info = self._resource_map[selection]
+            instrument = VisaInstrument(info)
+        else:
+            instrument = InstrumentSimulator()
+        instrument.settings = self.instrument.settings  # preserve current configuration
         try:
-            self.instrument.connect()
+            instrument.connect()
         except Exception as exc:  # pragma: no cover - defensive guard
             messagebox.showerror("错误", f"连接仪器失败: {exc}")
             return
-        self.device_status_var.set("已连接")
+        self.instrument = instrument  # type: ignore[assignment]
+        if isinstance(instrument, VisaInstrument):
+            status = instrument.info.display_name()
+        else:
+            status = "模拟器"
+        self.device_status_var.set(f"已连接 ({status})")
         self.summary_var.set("仪器连接成功")
-        self._log("仪器已连接")
+        self._log(f"仪器已连接: {status}")
 
     def disconnect_instrument(self) -> None:
         if not self.instrument.is_connected:
             messagebox.showinfo("提示", "仪器未连接")
             return
-        self.instrument.disconnect()
+        try:
+            self.instrument.disconnect()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            messagebox.showerror("错误", f"断开仪器失败: {exc}")
+            self._log(f"断开仪器失败: {exc}")
+            return
         self.device_status_var.set("未连接")
         self.summary_var.set("仪器已断开")
         self._log("仪器连接断开")
@@ -520,27 +968,82 @@ class MeasurementApp(tk.Tk):
         self.measurements.clear()
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        self.graph.set_data([])
+        self._refresh_graph()
         self.timestamp_value.config(text=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self.start_btn.state(["disabled"])
         self.stop_btn.state(["!disabled"])
-        self._log("开始测量")
-
+        self._current_setpoints = self._compute_setpoints()
+        if not self._current_setpoints:
+            messagebox.showerror("配置错误", "无法根据当前参数计算扫描点，请检查设置。")
+            self.summary_var.set("测量初始化失败")
+            self.start_btn.state(["!disabled"])
+            self.stop_btn.state(["disabled"])
+            return
+        try:
+            self.instrument.prepare_measurement(self._current_setpoints)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - depends on hardware
+            messagebox.showerror("错误", f"仪器初始化失败: {exc}")
+            self.summary_var.set("仪器初始化失败")
+            self.start_btn.state(["!disabled"])
+            self.stop_btn.state(["disabled"])
+            self._log(f"仪器初始化失败: {exc}")
+            self._current_setpoints = []
+            return
+        self._log(
+            f"开始测量，共 {len(self._current_setpoints)} 点，范围 {self._current_setpoints[0]:.4g} -> {self._current_setpoints[-1]:.4g}"
+        )
         self._measurement_thread = threading.Thread(target=self._run_measurement, daemon=True)
         self._measurement_thread.start()
 
     def _run_measurement(self) -> None:
+        dwell = max(self.instrument.settings.trigger_delay_ms / 1000.0, 0.05)
+        try:
+            for index, level in enumerate(self._current_setpoints, start=1):
+                if self._stop_event.is_set():
+                    break
+                point = self.instrument.generate_point(index, level)  # type: ignore[attr-defined]
+                self.measurements.append(point)
+                self.after(0, self._append_point, point)
+                time.sleep(dwell)
+        except Exception as exc:  # pragma: no cover - depends on hardware
+            self.after(0, lambda error=exc: self._measurement_error(error))
+        else:
+            self.after(0, self._measurement_finished)
+        finally:
+            try:
+                self.instrument.finalize_measurement()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            self._measurement_thread = None
+
+    def _compute_setpoints(self) -> List[float]:
         settings = self.instrument.settings
-        total_points = settings.sweep_points
-        self.instrument.start_measurement()
-        for index in range(1, int(total_points) + 1):
-            if self._stop_event.is_set():
-                break
-            point = self.instrument.generate_point(index)
-            self.measurements.append(point)
-            self.after(0, self._append_point, point)
-            time.sleep(max(settings.step * 0.2, 0.2))
-        self.after(0, self._measurement_finished)
+        points = max(int(settings.sweep_points), 1)
+        start = float(settings.start_level)
+        stop = float(settings.stop_level)
+        if points <= 1:
+            return [start]
+        step = float(settings.step)
+        if math.isclose(step, 0.0, rel_tol=1e-9, abs_tol=1e-12):
+            step = (stop - start) / max(points - 1, 1)
+        direction = 1 if stop >= start else -1
+        if direction > 0 and step < 0:
+            step = abs(step)
+        elif direction < 0 and step > 0:
+            step = -abs(step)
+        values = [start + i * step for i in range(points - 1)]
+        values.append(stop)
+        return values
+
+    def _measurement_error(self, error: Exception) -> None:
+        self._stop_event.set()
+        self.start_btn.state(["!disabled"])
+        self.stop_btn.state(["disabled"])
+        self.summary_var.set("测量失败")
+        messagebox.showerror("测量失败", f"测量过程中出现错误: {error}")
+        self._log(f"测量失败: {error}")
+        self._stop_event.clear()
+        self._current_setpoints = []
 
     # ------------------------------------------------------------------
     def _append_point(self, point: MeasurementPoint) -> None:
@@ -555,10 +1058,17 @@ class MeasurementApp(tk.Tk):
             f"{point.power:.6f}",
         )
         self.result_tree.insert("", tk.END, values=values)
-        self.graph.set_data(self.measurements)
+        self._refresh_graph()
         self._update_summary()
         if self.auto_save_var.get():
             self._auto_save_snapshot()
+
+    def _refresh_graph(self) -> None:
+        self.graph.set_data(
+            self.measurements,
+            x_axis=self.x_axis_var.get(),
+            y_axis=self.y_axis_var.get(),
+        )
 
     def _update_summary(self) -> None:
         if not self.measurements:
@@ -579,12 +1089,20 @@ class MeasurementApp(tk.Tk):
         else:
             self.summary_var.set("测量完成")
             self._log("测量完成")
+        self._stop_event.clear()
+        self._current_setpoints = []
 
     def stop_measurement(self) -> None:
         if self._measurement_thread and self._measurement_thread.is_alive():
             self._stop_event.set()
+            try:
+                self.instrument.abort_measurement()  # type: ignore[attr-defined]
+            except Exception:
+                pass
         self.start_btn.state(["!disabled"])
         self.stop_btn.state(["disabled"])
+        self.summary_var.set("测量已停止")
+        self._log("测量停止命令已执行")
 
     # ------------------------------------------------------------------
     def clear_results(self) -> None:
@@ -593,7 +1111,7 @@ class MeasurementApp(tk.Tk):
         self.measurements.clear()
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        self.graph.set_data([])
+        self._refresh_graph()
         self.summary_var.set("数据已清空")
         self._log("清空测量数据")
 
