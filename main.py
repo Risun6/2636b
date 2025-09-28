@@ -583,7 +583,7 @@ class MeasurementApp(tk.Tk):
         self.geometry("1280x720")
         self.minsize(1150, 650)
 
-        self.instrument: InstrumentSimulator = InstrumentSimulator()
+        self.instrument: InstrumentSimulator | VisaInstrument = InstrumentSimulator()
         self._measurement_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self.measurements: List[MeasurementPoint] = []
@@ -980,7 +980,7 @@ class MeasurementApp(tk.Tk):
             self.stop_btn.state(["disabled"])
             return
         try:
-            self.instrument.prepare_measurement(self._current_setpoints)
+            self.instrument.prepare_measurement(self._current_setpoints)  # type: ignore[attr-defined]
         except Exception as exc:  # pragma: no cover - depends on hardware
             messagebox.showerror("错误", f"仪器初始化失败: {exc}")
             self.summary_var.set("仪器初始化失败")
@@ -1001,7 +1001,7 @@ class MeasurementApp(tk.Tk):
             for index, level in enumerate(self._current_setpoints, start=1):
                 if self._stop_event.is_set():
                     break
-                point = self.instrument.generate_point(index, level)
+                point = self.instrument.generate_point(index, level)  # type: ignore[attr-defined]
                 self.measurements.append(point)
                 self.after(0, self._append_point, point)
                 time.sleep(dwell)
@@ -1011,7 +1011,7 @@ class MeasurementApp(tk.Tk):
             self.after(0, self._measurement_finished)
         finally:
             try:
-                self.instrument.finalize_measurement()
+                self.instrument.finalize_measurement()  # type: ignore[attr-defined]
             except Exception:
                 pass
             self._measurement_thread = None
@@ -1096,7 +1096,7 @@ class MeasurementApp(tk.Tk):
         if self._measurement_thread and self._measurement_thread.is_alive():
             self._stop_event.set()
             try:
-                self.instrument.abort_measurement()
+                self.instrument.abort_measurement()  # type: ignore[attr-defined]
             except Exception:
                 pass
         self.start_btn.state(["!disabled"])
